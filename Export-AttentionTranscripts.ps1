@@ -64,8 +64,10 @@ param(
     # Max retry attempts on transient failures (exponential back-off)
     [int]$MaxRetries           = 5,
 
-    # Optional: passthrough to documented filter[title] (substring match)
-    [string]$TitleContains     = "",
+    # Optional: passthrough to documented filter[title] (substring match).
+    # Accepts one or more terms; results are unioned and deduplicated so you can
+    # cover alternate spellings, e.g. -TitleContains "AB In","ABIn"
+    [string[]]$TitleContains   = @(),
 
     # Optional: passthrough to documented filter[participants.email] (one or more addresses)
     [string[]]$ParticipantEmails = @(),
@@ -324,7 +326,7 @@ Write-Host "  Begin Date : $(if ($effectiveBeginDate) { $effectiveBeginDate }` e
 Write-Host "  Page Size  : $PageSize"
 Write-Host "  Output Dir : $OutputDir"
 Write-Host "  Zip Output : $ZipOutput"
-if ($TitleContains -ne "")      { Write-Host "  Title Contains      : $TitleContains" }
+if ($TitleContains.Count -gt 0) { Write-Host "  Title Contains      : $($TitleContains -join ', ')" }
 if ($ParticipantEmails.Count -gt 0) { Write-Host "  Participant Emails  : $($ParticipantEmails -join ', ')" }
 if ($OpportunityIds.Count -gt 0)    { Write-Host "  Opportunity Ids     : $($OpportunityIds -join ', ')" }
 if ($DomainMap -ne "")          { Write-Host "  Domain Map          : $DomainMap" }
@@ -335,81 +337,102 @@ Write-Host ""
 # ── 1. Page through all conversations ────────────────────────────────────────
 Write-Host "Fetching conversations..." -ForegroundColor Cyan
 
-$allConversations = [System.Collections.Generic.List[object]]::new()
-$pageNumber       = 1
-$totalRecords     = $null
-$totalPages       = $null
-$errorCount       = 0
+$allConversations  = [System.Collections.Generic.List[object]]::new()
+$fetchedIds        = [System.Collections.Generic.HashSet[string]]::new()
+$errorCount        = 0
 
-do {
-    $queryParams = [System.Collections.Generic.List[string]]::new()
-    $queryParams.Add("page=$pageNumber")
-    $queryParams.Add("size=$PageSize")
+# Build the list of title-filter passes: one per term, or a single pass with no
+# title filter when -TitleContains was not supplied.
+$titlePasses = if ($TitleContains.Count -gt 0) { $TitleContains } else { @($null) }
 
-    if ($effectiveBeginDate -ne "") {
-        $fromDateTime = "${effectiveBeginDate}T00:00:00Z"
-        $queryParams.Add("fromDateTime=$([System.Uri]::EscapeDataString($fromDateTime))")
+foreach ($titleTerm in $titlePasses) {
+
+    if ($titleTerm) {
+        Write-Host "  Querying title term: '$titleTerm'" -ForegroundColor DarkCyan
     }
 
-    if ($TitleContains -ne "") {
-        $queryParams.Add("filter[title]=$([System.Uri]::EscapeDataString($TitleContains))")
-    }
+    $pageNumber   = 1
+    $totalRecords = $null
+    $totalPages   = $null
 
-    if ($ParticipantEmails.Count -gt 0) {
-        $queryParams.Add("filter[participants.email]=$([System.Uri]::EscapeDataString(($ParticipantEmails -join ',')))")
-    }
+    do {
+        $queryParams = [System.Collections.Generic.List[string]]::new()
+        $queryParams.Add("page=$pageNumber")
+        $queryParams.Add("size=$PageSize")
 
-    if ($OpportunityIds.Count -gt 0) {
-        $queryParams.Add("filter[external_opportunity.id]=$([System.Uri]::EscapeDataString(($OpportunityIds -join ',')))")
-    }
-
-    $uri = "$BaseUrl/conversations?$($queryParams -join '&')"
-
-    try {
-        $response = Invoke-WithRetry -MaxAttempts $MaxRetries -ScriptBlock {
-            Invoke-RestMethod `
-                -Uri $uri `
-                -Headers $Headers `
-                -Method Get
+        if ($effectiveBeginDate -ne "") {
+            $fromDateTime = "${effectiveBeginDate}T00:00:00Z"
+            $queryParams.Add("fromDateTime=$([System.Uri]::EscapeDataString($fromDateTime))")
         }
-    }
-    catch {
-        $errorCount++
-        Write-Host "  ERROR on page $pageNumber — $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "  Aborting further pagination." -ForegroundColor DarkRed
-        break
-    }
 
-    if ($null -eq $totalRecords) {
-        $totalRecords = $response.meta.totalRecords
-        $totalPages   = $response.meta.pageCount
-        Write-Host "  Total conversations : $totalRecords" -ForegroundColor Green
-        Write-Host "  Total pages         : $totalPages"  -ForegroundColor Green
-
-        if ($totalRecords -eq 0) {
-            Write-Host "`nNo conversations found for the given filters. Exiting." -ForegroundColor Yellow
-            exit 0
+        if ($titleTerm) {
+            $queryParams.Add("filter[title]=$([System.Uri]::EscapeDataString($titleTerm))")
         }
-    }
 
-    $pageItems = $response.data
-    if ($null -eq $pageItems -or $pageItems.Count -eq 0) {
-        Write-Host "  Page $pageNumber returned no items — stopping." -ForegroundColor DarkYellow
-        break
-    }
+        if ($ParticipantEmails.Count -gt 0) {
+            $queryParams.Add("filter[participants.email]=$([System.Uri]::EscapeDataString(($ParticipantEmails -join ',')))")
+        }
 
-    foreach ($conv in $pageItems) {
-        $allConversations.Add($conv)
-    }
+        if ($OpportunityIds.Count -gt 0) {
+            $queryParams.Add("filter[external_opportunity.id]=$([System.Uri]::EscapeDataString(($OpportunityIds -join ',')))")
+        }
 
-    Write-Host "  Page $pageNumber/$totalPages — retrieved $($allConversations.Count) of $totalRecords conversations" `
-        -ForegroundColor Gray
+        $uri = "$BaseUrl/conversations/list?$($queryParams -join '&')"
 
-    $pageNumber++
+        try {
+            $response = Invoke-WithRetry -MaxAttempts $MaxRetries -ScriptBlock {
+                Invoke-RestMethod `
+                    -Uri $uri `
+                    -Headers $Headers `
+                    -Method Get
+            }
+        }
+        catch {
+            $errorCount++
+            Write-Host "  ERROR on page $pageNumber — $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  Aborting further pagination." -ForegroundColor DarkRed
+            break
+        }
 
-} while ($pageNumber -le $totalPages)
+        if ($null -eq $totalRecords) {
+            $totalRecords = $response.meta.totalRecords
+            $totalPages   = $response.meta.pageCount
+            Write-Host "  Total conversations : $totalRecords" -ForegroundColor Green
+            Write-Host "  Total pages         : $totalPages"  -ForegroundColor Green
 
-Write-Host "`nPagination complete. $($allConversations.Count) conversations retrieved." -ForegroundColor Green
+            if ($totalRecords -eq 0) {
+                Write-Host "  No conversations found for this term — continuing." -ForegroundColor Yellow
+                break
+            }
+        }
+
+        $pageItems = $response.data
+        if ($null -eq $pageItems -or $pageItems.Count -eq 0) {
+            Write-Host "  Page $pageNumber returned no items — stopping." -ForegroundColor DarkYellow
+            break
+        }
+
+        foreach ($conv in $pageItems) {
+            $cid = if ($conv.id) { $conv.id } else { $conv.attributes.uuid }
+            if ($fetchedIds.Add($cid)) {
+                $allConversations.Add($conv)
+            }
+        }
+
+        Write-Host "  Page $pageNumber/$totalPages — $($allConversations.Count) unique conversations so far" `
+            -ForegroundColor Gray
+
+        $pageNumber++
+
+    } while ($pageNumber -le $totalPages)
+}
+
+if ($allConversations.Count -eq 0) {
+    Write-Host "`nNo conversations found for the given filters. Exiting." -ForegroundColor Yellow
+    exit 0
+}
+
+Write-Host "`nPagination complete. $($allConversations.Count) unique conversations retrieved." -ForegroundColor Green
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── 2. Write each conversation as a slim, tagged JSON file ────────────────────
@@ -568,6 +591,7 @@ Write-Host "══════════════════════�
 Write-Host "  SUMMARY"                                  -ForegroundColor Cyan
 Write-Host "══════════════════════════════════════════" -ForegroundColor Cyan
 Write-Host "  API total reported   : $totalRecords"
+Write-Host "  Title terms searched : $(if ($TitleContains.Count -gt 0) { "$($TitleContains.Count) ($($TitleContains -join ', '))" } else { '(none — all titles)' })"
 Write-Host "  Conversations fetched: $($allConversations.Count)"
 Write-Host "  JSON files saved     : $savedCount"
 Write-Host "  Save errors          : $saveErrors"
