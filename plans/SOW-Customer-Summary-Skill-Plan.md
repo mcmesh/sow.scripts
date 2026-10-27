@@ -29,8 +29,14 @@ skills/
     references/
       selection-rules.md
       output-format.md
+      handoff-format.md
+      example-report.md
     scripts/
       New-SowCustomerSummaryInput.ps1
+      Test-SowCustomerSummary.ps1
+    fixtures/
+      New-SowFixtures.ps1
+      README.md
     templates/
       customer-summary.md
 ```
@@ -38,9 +44,13 @@ skills/
 - `SKILL.md` will contain the short agent workflow and activation guidance.
 - `selection-rules.md` will document customer matching, version grouping, and
   signed-off ranking.
-- `output-format.md` will define summarization and source-traceability rules.
+- `output-format.md` will define summarization, source-traceability, and
+  existing-report update rules.
+- `example-report.md` is a fictional, fully rendered report that anchors prose
+  style, table fill-in, and caveat wording for every customer.
 - `New-SowCustomerSummaryInput.ps1` will perform deterministic discovery,
-  text extraction, candidate ranking, and interactive selection.
+  text extraction, candidate ranking, interactive selection, and comparison
+  against an existing report.
 - `customer-summary.md` will keep generated reports consistent.
 
 Add `references/handoff-format.md` for the JSON contract and `fixtures/` for
@@ -84,10 +94,10 @@ Planned parameters:
 | `CustomerName` | Prompt when omitted; used for normalized filename, folder, and content matching |
 | `CustomerAliases` | Optional explicit aliases or legal names; no automatic subsidiary inference |
 | `SourceFolder` | Prompt when omitted; validated before scanning |
-| `OutputPath` | Prompt when omitted; must end in `.md` |
+| `OutputPath` | Prompt when omitted; must end in `.md`; an existing file is preserved and updated (see Update Mode) |
 | `SelectionMode` | `Auto` or `Prompt`; prompt when omitted |
 | `Recurse` | Search child folders; enabled by default; accept `-Recurse:$false` |
-| `Force` | Permit replacement of an existing output file |
+| `Force` | Replace an existing output file with a newly generated report instead of updating it; the agent still backs up the old report |
 | `NonInteractive` | Never read stdin; return missing inputs and unresolved groups to the agent |
 | `AllowIncompleteCoverage` | Permit a report after explicit exclusion of failed or unresolved candidates; disclose all exclusions |
 
@@ -434,8 +444,75 @@ deliverables or outcomes, and relationship to the earlier work in that order.>
 
 If only one agreement is included, omit `Additional Work`. Keep `Review Notes` even
 when there are no warnings so every report has an explicit review state. If the
-output path already exists, stop unless `Force` is set; later versions may
-support a deliberate merge/update mode.
+output path already exists, the report is preserved and updated (see Update Mode);
+a full regeneration requires `Force` or an `overwriteOutput` decision.
+
+## Update Mode (Existing Report)
+
+Added after the first version. When the output path already exists and neither
+`Force` nor an `overwriteOutput` decision is present, the helper runs in
+`update` mode instead of stopping. The existing report is preserved, including
+manual edits, and only information newer than the previous run is added.
+
+### Helper behavior
+
+- The helper never writes the report. It parses the existing report's Sources
+  table (`N / doc-id` rows and backticked paths), `Report generated` value, all
+  backticked paths, and the `grp-`/`file-` IDs in Review Notes bullets that
+  contain `skipped` or `excluded`.
+- Document and group IDs are content-derived and stable, so an ID in the old
+  report matches the same document on a later run. The helper re-scans the whole
+  folder, so newer and older files are found the same way.
+- A group with a previously reported document keeps it (`Previously reported`)
+  without asking again, unless another candidate in the group has equal or
+  higher signature status (minimum `Unverified`); then the group is unresolved
+  and the user keeps the old document or supersedes it.
+- Groups and failed files recorded as skipped/excluded in Review Notes are
+  carried forward and not asked about again; an explicit decision overrides.
+- Each selected document carries `updateStatus` (`unchanged`, `new`,
+  `supersedes`), `supersedesDocumentId`, and `reportSequence`. Unchanged
+  documents omit `sections` to save context.
+- The `update` object lists new, superseding, and unchanged document IDs, new
+  hash-identical source paths, reported documents missing from the folder
+  (preserved, with a warning), carried-forward IDs, `hasChanges`, and a
+  suggested `backupPath`.
+- Chronology decisions are requested only when a new or superseding document
+  has a missing or duplicate effective date; ordering otherwise falls back to
+  the existing Sources sequence.
+- An existing file with no recognizable Sources table returns exit `2`.
+- Handoff `schemaVersion` stays `1.0`; the new fields are additive, with a new
+  top-level `mode` of `create`, `update`, or `replace`.
+
+### Agent behavior
+
+1. Stop without writing when `update.hasChanges` is false.
+2. Back up the report to `update.backupPath`.
+3. Preserve all text for unchanged documents verbatim.
+4. Add Additional Work blocks for new documents in chronological order; ask
+   before a document older than the current initial SOW becomes the initial SOW.
+5. Rewrite only the affected block and Sources row for superseded documents and
+   record the old ID in Review Notes.
+6. Keep documents missing from the folder, refresh the header table and
+   executive summary within word targets, renumber Sources chronologically
+   without changing IDs, and add an `Update <date>` Review Notes bullet.
+7. Validate that no previously reported ID was dropped, then replace atomically.
+
+### Known limits
+
+- Decisions are recovered only from report content; hand-edited Review Notes
+  that omit the helper's IDs cause skipped groups to be asked about again.
+- Reports generated before this change that list skipped items without IDs, or
+  that do not use the template's Sources table, are not updatable.
+- A previously reported file whose content changed appears as missing (new hash)
+  and its replacement as a new or superseding document.
+
+## Change Log
+
+| Change | Files |
+|---|---|
+| Added a fictional, fully rendered style example and linked it from the workflow and output rules; real customer data is not committed | `references/example-report.md`, `SKILL.md`, `references/output-format.md` |
+| Added update mode, handoff fields, agent update rules, and tests for update, no-change, missing-document, carried-forward, unrecognized-report, replace, and revision/supersede cases | `scripts/New-SowCustomerSummaryInput.ps1`, `scripts/Test-SowCustomerSummary.ps1`, `references/handoff-format.md`, `references/output-format.md`, `SKILL.md` |
+| Review Notes must record helper group/candidate IDs for skipped or excluded items so later updates can carry them forward | `references/output-format.md`, `references/example-report.md` |
 
 ## Error Handling and Safety
 
@@ -458,6 +535,8 @@ support a deliberate merge/update mode.
 - Write to a temporary sibling file and replace the destination only after the
   complete report passes validation. Recheck overwrite authorization, preserve
   an existing report on failure, and clean up temporary extracted content.
+  In update mode, back up the existing report first and never drop a previously
+  reported document ID.
 
 ## Implementation Phases
 
@@ -529,6 +608,9 @@ support a deliberate merge/update mode.
   including linked amendments and change orders.
 - The report contains no unsupported customer or project claims.
 - Every summarized SOW appears in the source table.
+- An existing report is preserved and updated, never regenerated, unless
+  replacement is explicitly authorized; new, older, and superseding files are
+  added without re-asking previously made decisions.
 - Source files remain unchanged and output replacement requires explicit intent.
 - Reports distinguish contracted scope from completion and signature evidence
   from confidence and user selection.
@@ -546,5 +628,6 @@ support a deliberate merge/update mode.
 - SharePoint or Microsoft Graph folder input.
 - Automatic semantic matching for customer aliases and subsidiaries (explicit
   user-supplied aliases are supported in the first version).
-- Incremental updates to an existing customer summary.
+- Incremental updates are implemented (see Update Mode); deferred refinements
+  are a sidecar state file for decisions and a structured diff report between runs.
 - Cryptographic or legal validation of electronic signatures.

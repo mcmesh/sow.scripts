@@ -18,6 +18,9 @@ param(
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
 
+# create: no report exists; update: preserve the existing report and add changes; replace: -Force or overwriteOutput
+$mode = "create"
+
 function Write-Diagnostic {
     param([string]$Message)
     [Console]::Error.WriteLine($Message)
@@ -68,6 +71,7 @@ function New-BaseResult {
     return [ordered]@{
         schemaVersion      = "1.0"
         status             = $Status
+        mode               = $mode
         customer           = [ordered]@{
             requestedName = $CustomerName
             aliases       = @($CustomerAliases)
@@ -538,6 +542,66 @@ function Get-DecisionForGroup {
     return $Decisions.groupDecisions | Where-Object { $_.groupId -eq $GroupId } | Select-Object -First 1
 }
 
+function Get-SignatureRank {
+    param([string]$Status)
+
+    switch ($Status) {
+        "Execution evidence detected" { return 3 }
+        "Partially signed" { return 2 }
+        "Unverified" { return 1 }
+        default { return 0 }
+    }
+}
+
+function Read-ExistingReport {
+    param([string]$Path)
+
+    $sources = [System.Collections.Generic.List[object]]::new()
+    $skippedGroupIds = [System.Collections.Generic.List[string]]::new()
+    $excludedFileIds = [System.Collections.Generic.List[string]]::new()
+    $section = ""
+    $generated = $null
+    $allPaths = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        foreach ($match in [regex]::Matches($line, '`([^`]+)`')) {
+            $allPaths.Add($match.Groups[1].Value)
+        }
+        if ($line -match '^##\s+(.+?)\s*$') {
+            $section = $Matches[1]
+            continue
+        }
+        if ($null -eq $generated -and $line -match '^\|\s*Report generated\s*\|\s*([^|]+?)\s*\|') {
+            $generated = $Matches[1]
+        }
+        if ($section -eq "Sources" -and $line -match '^\|\s*(\d+)\s*/\s*(doc-[0-9a-f]{12})\b') {
+            $paths = @([regex]::Matches($line, '`([^`]+)`') | ForEach-Object { $_.Groups[1].Value })
+            $sources.Add([pscustomobject]@{
+                documentId = $Matches[2]
+                sequence   = [int]$Matches[1]
+                paths      = $paths
+            })
+        }
+        elseif ($section -eq "Review Notes" -and $line -match '^\s*-\s' -and $line -match '(?i)\b(excluded|skipped)\b') {
+            foreach ($match in [regex]::Matches($line, '\bgrp-[0-9a-f]{12}\b')) {
+                $skippedGroupIds.Add($match.Value)
+            }
+            foreach ($match in [regex]::Matches($line, '\bfile-[0-9a-f]{12}\b')) {
+                $excludedFileIds.Add($match.Value)
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        sha256          = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        generated       = $generated
+        sources         = $sources.ToArray()
+        allPaths        = @($allPaths | Select-Object -Unique)
+        skippedGroupIds = @($skippedGroupIds | Select-Object -Unique)
+        excludedFileIds = @($excludedFileIds | Select-Object -Unique)
+    }
+}
+
 function Get-DecisionForFile {
     param(
         [pscustomobject]$Decisions,
@@ -603,20 +667,27 @@ try {
     if ($null -ne $decisions -and $decisions.overwriteOutput) {
         $overwriteApproved = $true
     }
-    if ((Test-Path -LiteralPath $OutputPath) -and -not $overwriteApproved) {
-        if ($NonInteractive) {
-            $result = New-BaseResult -Status "needs_input"
-            $result.sourceFolder = $SourceFolder
-            $result.output.path = $OutputPath
-            $result.warnings = @("Output exists and overwrite is not authorized: $OutputPath")
-            Write-ResultAndExit -Result $result -ExitCode 2
-        }
-        $answer = Read-Host "Output exists. Replace it? (yes/no)"
-        if ($answer -notmatch '^(y|yes)$') {
-            throw "Output replacement was not authorized."
-        }
-        $overwriteApproved = $true
+    $existing = $null
+    if (Test-Path -LiteralPath $OutputPath -PathType Container) {
+        throw "OutputPath is a directory: $OutputPath"
     }
+    if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
+        if ($overwriteApproved) {
+            $mode = "replace"
+        }
+        else {
+            $mode = "update"
+            $existing = Read-ExistingReport -Path $OutputPath
+            if ($existing.sources.Count -eq 0) {
+                $result = New-BaseResult -Status "needs_input"
+                $result.sourceFolder = $SourceFolder
+                $result.output.path = $OutputPath
+                $result.warnings = @("Existing output has no recognizable Sources table, so it cannot be updated: $OutputPath. Choose another output path or authorize replacement with -Force.")
+                Write-ResultAndExit -Result $result -ExitCode 2
+            }
+        }
+    }
+    $previousIds = if ($null -ne $existing) { @($existing.sources | ForEach-Object { $_.documentId }) } else { @() }
 
     $pdfTool = Get-PdfTool
     $names = @($CustomerName) + @($CustomerAliases | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -774,6 +845,20 @@ try {
         $chosen = $null
         $selectionMethod = $null
 
+        $previous = $null
+        $keepPrevious = $false
+        if ($mode -eq "update") {
+            $previous = $ranked | Where-Object { $_.documentId -in $previousIds } | Select-Object -First 1
+            if ($null -ne $previous) {
+                $previousRank = Get-SignatureRank -Status $previous.signatureStatus
+                $revisions = @($ranked | Where-Object {
+                    $_.documentId -ne $previous.documentId -and
+                    (Get-SignatureRank -Status $_.signatureStatus) -ge [Math]::Max(1, $previousRank)
+                })
+                $keepPrevious = $revisions.Count -eq 0
+            }
+        }
+
         if ($null -ne $decision) {
             if ($decision.action -eq "select") {
                 $chosen = $ranked | Where-Object { $_.documentId -eq $decision.documentId } | Select-Object -First 1
@@ -800,6 +885,20 @@ try {
             else {
                 throw "Unsupported group decision action '$($decision.action)' for $groupId."
             }
+        }
+        elseif ($keepPrevious) {
+            $chosen = $previous
+            $selectionMethod = "Previously reported"
+        }
+        elseif ($mode -eq "update" -and $null -eq $previous -and $groupId -in $existing.skippedGroupIds) {
+            $unresolved.Add([pscustomobject]@{
+                groupId        = $groupId
+                action         = "skipped"
+                reason         = "Carried forward: the existing report records this group as skipped or excluded."
+                carriedForward = $true
+                candidates     = @($ranked | Select-Object documentId, path, title, signatureStatus)
+            })
+            continue
         }
         elseif ($SelectionMode -eq "Auto") {
             $top = $ranked[0]
@@ -839,10 +938,16 @@ try {
         }
 
         if ($null -eq $chosen) {
+            $unresolvedReason = if ($null -ne $previous) {
+                "A new candidate may revise the previously reported document $($previous.documentId). Choose the previous document to keep it or a new one to supersede it."
+            }
+            else {
+                "No unique high-confidence executed candidate was selected."
+            }
             $unresolved.Add([pscustomobject]@{
                 groupId    = $groupId
                 action     = "unresolved"
-                reason     = "No unique high-confidence executed candidate was selected."
+                reason     = $unresolvedReason
                 candidates = @($ranked | Select-Object documentId, path, title, agreementType, signatureStatus, signatureScore, customerScore, selectionEvidence)
             })
             continue
@@ -858,9 +963,35 @@ try {
             "Low"
         }
 
+        $updateStatus = $null
+        $supersedes = $null
+        $reportSequence = $null
+        if ($mode -eq "update") {
+            if ($chosen.documentId -in $previousIds) {
+                $updateStatus = "unchanged"
+                $reportSequence = ($existing.sources | Where-Object { $_.documentId -eq $chosen.documentId } | Select-Object -First 1).sequence
+            }
+            elseif ($null -ne $previous) {
+                $updateStatus = "supersedes"
+                $supersedes = $previous.documentId
+                $reportSequence = ($existing.sources | Where-Object { $_.documentId -eq $previous.documentId } | Select-Object -First 1).sequence
+            }
+            else {
+                $updateStatus = "new"
+            }
+        }
+
+        $sections = @($chosen.sections)
+        if ($updateStatus -eq "unchanged") {
+            $sections = @()
+        }
+
         $selected.Add([pscustomobject]@{
             documentId         = $chosen.documentId
             groupId            = $chosen.groupId
+            updateStatus       = $updateStatus
+            supersedesDocumentId = $supersedes
+            reportSequence     = $reportSequence
             sourcePaths        = @($chosen.sourcePaths)
             sha256             = $chosen.sha256
             agreementType      = $chosen.agreementType
@@ -880,7 +1011,7 @@ try {
             matchEvidence       = @($chosen.matchEvidence)
             selectionEvidence   = @($chosen.selectionEvidence)
             extraction          = $chosen.extraction
-            sections            = @($chosen.sections)
+            sections            = $sections
             warnings            = @($chosen.warnings)
         })
 
@@ -913,6 +1044,14 @@ try {
                 reason      = $fileDecision.reason
             })
         }
+        elseif ($mode -eq "update" -and $failure.candidateId -in $existing.excludedFileIds) {
+            $excludedFiles.Add([pscustomobject]@{
+                candidateId    = $failure.candidateId
+                path           = $failure.path
+                reason         = "Carried forward: the existing report records this file as excluded."
+                carriedForward = $true
+            })
+        }
         elseif ($failure.relevant) {
             $blockingFailures.Add($failure)
         }
@@ -933,8 +1072,10 @@ try {
 
     if ($selected.Count -gt 1 -and $chronology.Count -ne $selected.Count) {
         $knownDates = @($selected | ForEach-Object { $_.dates.effective })
-        $hasMissingDate = @($knownDates | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0
-        $hasDuplicateDate = @($knownDates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Group-Object | Where-Object { $_.Count -gt 1 }).Count -gt 0
+        $changed = @($selected | Where-Object { $_.updateStatus -ne "unchanged" })
+        $hasMissingDate = @($changed | Where-Object { [string]::IsNullOrWhiteSpace($_.dates.effective) }).Count -gt 0
+        $duplicateDates = @($knownDates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+        $hasDuplicateDate = @($changed | Where-Object { $_.dates.effective -in $duplicateDates }).Count -gt 0
         if ($hasMissingDate -or $hasDuplicateDate) {
             $unresolved.Add([pscustomobject]@{
                 groupId    = "chronology"
@@ -959,6 +1100,10 @@ try {
         Expression = {
             if ($_.dates.effective) { $_.dates.effective } else { "9999-12-31" }
         }
+    }, @{
+        Expression = {
+            if ($null -ne $_.reportSequence) { [int]$_.reportSequence } else { [int]::MaxValue }
+        }
     }, groupId)
 
     $result = New-BaseResult -Status $(if ($requiresInput) { "needs_input" } else { "ready" })
@@ -982,6 +1127,49 @@ try {
     $result.failedFiles = $blockingFailures.ToArray()
     $result.unresolvedGroups = $unresolved.ToArray()
     $result.warnings = $warnings.ToArray()
+
+    if ($mode -eq "update") {
+        $missing = @($existing.sources | Where-Object { $_.documentId -notin $knownDocumentIds } | ForEach-Object {
+            [pscustomobject]@{
+                documentId     = $_.documentId
+                sequence       = $_.sequence
+                paths          = @($_.paths)
+                pathsStillExist = @($_.paths | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }).Count -gt 0
+            }
+        })
+        $unchanged = @($orderedSelected | Where-Object { $_.updateStatus -eq "unchanged" })
+        $newDocuments = @($orderedSelected | Where-Object { $_.updateStatus -eq "new" })
+        $superseding = @($orderedSelected | Where-Object { $_.updateStatus -eq "supersedes" })
+        $newCopies = @($unchanged | ForEach-Object {
+            $document = $_
+            $added = @($document.sourcePaths | Where-Object { $_ -notin $existing.allPaths })
+            if ($added.Count -gt 0) {
+                [pscustomobject]@{ documentId = $document.documentId; newSourcePaths = $added }
+            }
+        })
+        foreach ($entry in $missing) {
+            $result.warnings += "Previously reported document $($entry.documentId) was not found in the source folder$(if ($entry.pathsStillExist) { '; its file exists at the old path but its content changed' } else { '' }). It is preserved in the report."
+        }
+        $result.update = [ordered]@{
+            existingReport = [ordered]@{
+                path            = $OutputPath
+                sha256          = $existing.sha256
+                reportGenerated = $existing.generated
+                sourceCount     = $existing.sources.Count
+            }
+            backupPath          = "$OutputPath.bak-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))"
+            hasChanges          = ($newDocuments.Count + $superseding.Count + $newCopies.Count) -gt 0
+            newDocumentIds      = @($newDocuments | ForEach-Object { $_.documentId })
+            supersedingDocumentIds = @($superseding | ForEach-Object { $_.documentId })
+            unchangedDocumentIds = @($unchanged | ForEach-Object { $_.documentId })
+            unchangedWithNewSourcePaths = $newCopies
+            missingFromFolder   = $missing
+            carriedForward      = [ordered]@{
+                groupIds = @($unresolved | Where-Object { $_.PSObject.Properties["carriedForward"] } | ForEach-Object { $_.groupId })
+                fileIds  = @($excludedFiles | Where-Object { $_.PSObject.Properties["carriedForward"] } | ForEach-Object { $_.candidateId })
+            }
+        }
+    }
 
     Write-ResultAndExit -Result $result -ExitCode $(if ($requiresInput) { 2 } else { 0 })
 }

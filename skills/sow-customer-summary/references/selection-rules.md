@@ -1,5 +1,10 @@
 # SOW Selection Rules
 
+For customer-research reports, apply the agent-level defaults in
+[research-policy.md](research-policy.md). The strict automatic-selection rules
+below describe the helper, not a prohibition on policy-authorized inclusion with
+execution caveats or on retaining multiple revisions through separate handoffs.
+
 ## Customer Match
 
 Match supplied names and aliases against contracting-party text first, then
@@ -10,6 +15,8 @@ overrides filename/folder hints. Never infer subsidiaries or aliases.
 
 Group revisions using agreement ID, parties, title, dates, normalized filename,
 and scope evidence. Hash-identical files are copies with multiple source paths.
+Text-equivalent files may differ in signature images or annotations; inspect
+material differences before treating them as equivalent evidence.
 Keep amendments and change orders as separate groups linked to a parent. Do not
 merge documents solely because their names are similar.
 

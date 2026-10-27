@@ -208,6 +208,100 @@ try {
     Assert-Equal $missingResult.exitCode 2 "Missing-input exit code."
     Assert-Equal $missingResult.json.status "needs_input" "Missing-input status."
 
+    function New-ReportStub {
+        param(
+            [string]$Path,
+            [string[]]$DocumentIds,
+            [string[]]$ReviewNotes = @()
+        )
+        $lines = @("# Customer Engagement Summary: Contoso", "", "| Report detail | Value |", "|---|---|", "| Report generated | 2026-01-01 |", "", "## Sources", "", "| Sequence / source ID | Agreement | Source path |", "|---|---|---|")
+        for ($index = 0; $index -lt $DocumentIds.Count; $index++) {
+            $lines += "| $($index + 1) / $($DocumentIds[$index]) | Agreement | ``/old/path-$index.docx`` |"
+        }
+        $lines += @("", "## Review Notes", "")
+        $lines += $ReviewNotes
+        Set-Content -LiteralPath $Path -Value $lines -Encoding utf8
+    }
+
+    $baseDocument = $readyResult.json.selectedDocuments | Where-Object { $_.agreementType -eq "SOW" } | Select-Object -First 1
+    $changeOrder = $readyResult.json.selectedDocuments | Where-Object { $_.agreementType -eq "Change order" } | Select-Object -First 1
+    $updateArguments = @(
+        "-CustomerName", "Contosó",
+        "-SourceFolder", $fixtures.ready,
+        "-SelectionMode", "Auto",
+        "-NonInteractive"
+    )
+
+    $updatePath = Join-Path $outputDirectory "update.md"
+    New-ReportStub -Path $updatePath -DocumentIds @($baseDocument.documentId)
+    $originalReport = Get-Content -LiteralPath $updatePath -Raw
+    $updateResult = Invoke-HelperProcess -Arguments ($updateArguments + @("-OutputPath", $updatePath))
+    Assert-Equal $updateResult.exitCode 0 "Update mode exit code."
+    Assert-Equal $updateResult.json.mode "update" "Existing report should trigger update mode."
+    Assert-True $updateResult.json.update.hasChanges "Update should detect the new change order."
+    Assert-Equal @($updateResult.json.update.newDocumentIds).Count 1 "Update new document count."
+    Assert-Equal $updateResult.json.update.newDocumentIds[0] $changeOrder.documentId "Update new document id."
+    Assert-Equal @($updateResult.json.update.unchangedDocumentIds).Count 1 "Update unchanged document count."
+    $unchangedDocument = $updateResult.json.selectedDocuments | Where-Object { $_.documentId -eq $baseDocument.documentId }
+    Assert-Equal $unchangedDocument.updateStatus "unchanged" "Previously reported document status."
+    Assert-Equal $unchangedDocument.selectionMethod "Previously reported" "Previously reported selection method."
+    Assert-Equal @($unchangedDocument.sections).Count 0 "Unchanged documents should omit extracted sections."
+    Assert-True ($updateResult.json.update.backupPath -like "$updatePath.bak-*") "Backup path was not suggested."
+    Assert-Equal (Get-Content -LiteralPath $updatePath -Raw) $originalReport "The helper must not modify the existing report."
+
+    New-ReportStub -Path $updatePath -DocumentIds @($baseDocument.documentId, $changeOrder.documentId) -ReviewNotes @("- Additional source paths: " + ((@($baseDocument.sourcePaths) + @($changeOrder.sourcePaths) | ForEach-Object { "``$_``" }) -join ", "))
+    $noChangeResult = Invoke-HelperProcess -Arguments ($updateArguments + @("-OutputPath", $updatePath))
+    Assert-Equal $noChangeResult.exitCode 0 "No-change update exit code."
+    Assert-True (-not $noChangeResult.json.update.hasChanges) "A complete report should report no changes."
+
+    New-ReportStub -Path $updatePath -DocumentIds @($baseDocument.documentId, "doc-000000000000")
+    $missingDocumentResult = Invoke-HelperProcess -Arguments ($updateArguments + @("-OutputPath", $updatePath))
+    Assert-Equal @($missingDocumentResult.json.update.missingFromFolder).Count 1 "Missing previously reported document count."
+    Assert-Equal $missingDocumentResult.json.update.missingFromFolder[0].documentId "doc-000000000000" "Missing document id."
+
+    New-ReportStub -Path $updatePath -DocumentIds @($baseDocument.documentId) -ReviewNotes @("- Helper group ``$($changeOrder.groupId)`` was skipped by the user.")
+    $carriedResult = Invoke-HelperProcess -Arguments ($updateArguments + @("-OutputPath", $updatePath))
+    Assert-Equal $carriedResult.exitCode 0 "Carried-forward skip exit code."
+    Assert-Equal @($carriedResult.json.update.newDocumentIds).Count 0 "A skipped group must not reappear as new."
+    Assert-Equal $carriedResult.json.update.carriedForward.groupIds[0] $changeOrder.groupId "Carried-forward group id."
+
+    Set-Content -LiteralPath $updatePath -Value "Not a report." -Encoding utf8
+    $unrecognizedResult = Invoke-HelperProcess -Arguments ($updateArguments + @("-OutputPath", $updatePath))
+    Assert-Equal $unrecognizedResult.exitCode 2 "Unrecognized existing report exit code."
+
+    $replaceResult = Invoke-HelperProcess -Arguments ($updateArguments + @("-OutputPath", $updatePath, "-Force"))
+    Assert-Equal $replaceResult.exitCode 0 "Replace mode exit code."
+    Assert-Equal $replaceResult.json.mode "replace" "Force should select replace mode."
+
+    $revisionPath = Join-Path $outputDirectory "revision.md"
+    $previousCandidate = $group.candidates[0]
+    $newCandidate = $group.candidates[1]
+    New-ReportStub -Path $revisionPath -DocumentIds @($previousCandidate.documentId)
+    $revisionArguments = @(
+        "-CustomerName", "Contoso",
+        "-SourceFolder", $fixtures.ambiguous,
+        "-OutputPath", $revisionPath,
+        "-SelectionMode", "Auto",
+        "-NonInteractive"
+    )
+    $revisionResult = Invoke-HelperProcess -Arguments $revisionArguments
+    Assert-Equal $revisionResult.exitCode 2 "A competing executed revision should require a decision."
+    Assert-True ($revisionResult.json.unresolvedGroups[0].reason -match "revise") "Revision reason was not reported."
+
+    $supersedePath = Join-Path $temporaryRoot "supersede-decisions.json"
+    @{
+        schemaVersion = "1.0"
+        allowIncompleteCoverage = $false
+        overwriteOutput = $false
+        groupDecisions = @(@{ groupId = $group.groupId; action = "select"; documentId = $newCandidate.documentId })
+        fileDecisions = @()
+        chronology = @(@{ groupId = $group.groupId; order = 1 })
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $supersedePath -Encoding utf8
+    $supersedeResult = Invoke-HelperProcess -Arguments ($revisionArguments + @("-DecisionFile", $supersedePath))
+    Assert-Equal $supersedeResult.exitCode 0 "Supersede decision exit code."
+    Assert-Equal $supersedeResult.json.selectedDocuments[0].updateStatus "supersedes" "Superseding revision status."
+    Assert-Equal $supersedeResult.json.selectedDocuments[0].supersedesDocumentId $previousCandidate.documentId "Superseded document id."
+
     Write-Host "All SOW customer summary checks passed."
 }
 finally {
