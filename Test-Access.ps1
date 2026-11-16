@@ -1,7 +1,7 @@
 ﻿# Store your client secret in an environment variable before running, e.g.:
 #   $env:GRAPH_CLIENT_SECRET = "your_secret_here"
 $TenantId     = "d49110b2-6f26-4c66-b723-1729cdb9a3cf"
-$ClientId     = "5b5e9181-c9a9-4c5c-8036-8e58f5c7b10b"
+$ClientId     = "5b5e9181-c9a9-4c5c-8036-8e58f5c7b10b" #"9051ff18-d122-4e52-a378-838f688889e8"
 $ClientSecret = $env:GRAPH_CLIENT_SECRET
 $Resource     = "https://meshsystemsus.sharepoint.com"
 
@@ -37,6 +37,11 @@ Write-Host "aud : $($payload.aud)"
 Write-Host "appid: $($payload.appid)"
 Write-Host "tid : $($payload.tid)"
 
+# Build headers with the acquired token
+$headers = @{
+    "Authorization" = "Bearer $token"
+    "Content-Type"  = "application/json"
+}
 
 # Use your existing Graph token
 $regionCheck = Invoke-RestMethod `
